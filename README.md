@@ -319,14 +319,12 @@ Distribuído sob a licença **MIT**. Veja `LICENSE` para mais informações.
 ## 👤 Autor
 
 **Gustavo Jannuzzi**  
-📧 Mestrado em Administração — Análise de Investimentos  
+📧 UFPR - PPGOLD — Análise de Investimentos  
 🔗 [github.com/GustavoJannuzzi](https://github.com/GustavoJannuzzi)
 
 ---
 
 <div align="center">
-
-Feito com ❤️ e muito Python 🐍
 
 *"Diversification is the only free lunch in investing."* — Harry Markowitz
 

@@ -4,127 +4,157 @@ import io
 import streamlit as st
 
 
-def _pct(s: pd.Series) -> pd.Series:
-    """Converte strings percentuais no formato brasileiro (ex: '12,34%') para float."""
-    return (
-        s.astype(str)
-        .str.replace("%", "", regex=False)
-        .str.replace(".", "", regex=False)
-        .str.replace(",", ".", regex=False)
-        .pipe(pd.to_numeric, errors="coerce")
-        / 100
-    )
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTA TÉCNICA:
+# O Fundamentus usa JavaScript para renderizar P/L, P/VP, EV/EBITDA e
+# Liq.2meses no cliente. Via scraping estático (requests), esses campos
+# chegam como placeholders '000'. Apenas ROE, ROIC, Mrg.Líq., Mrg.Ebit,
+# Div.Yield e Cresc.Rec chegam como strings reais.
+# Os filtros disponíveis refletem apenas os campos com dados reais.
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-def _num(s: pd.Series) -> pd.Series:
-    """Converte strings numéricas no formato brasileiro para float."""
-    return (
-        s.astype(str)
-        .str.replace(".", "", regex=False)
-        .str.replace(",", ".", regex=False)
-        .pipe(pd.to_numeric, errors="coerce")
-    )
+def _pct_br(val) -> float:
+    """Converte string percentual BR ('32,15%' ou '-3,50%') para fração decimal."""
+    if val is None:
+        return float("nan")
+    if isinstance(val, (int, float)):
+        return float(val) / 100.0 if abs(float(val)) > 1.5 else float(val)
+    s = str(val).strip().replace("%", "").strip()
+    if s in ("", "-", "000", "0000", "0,00", "0.00"):
+        return 0.0  # zero real, não placeholder
+    s = s.replace(".", "").replace(",", ".")
+    try:
+        v = float(s)
+        # Fundamentus retorna em escala 0-100, normalizar para 0-1
+        return v / 100.0
+    except ValueError:
+        return float("nan")
+
+
+def _num_br(val) -> float:
+    """Converte número BR. Placeholders '000' → NaN."""
+    if val is None:
+        return float("nan")
+    if isinstance(val, (int, float)):
+        f = float(val)
+        return float("nan") if f == 0.0 else f
+    s = str(val).strip()
+    if s in ("000", "0000", "00000", "", "-"):
+        return float("nan")
+    s = s.replace(",", ".") if "," in s and "." not in s else s.replace(".", "", s.count(".") - 1 if "," in s else 0).replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return float("nan")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fundamentus() -> pd.DataFrame:
     """
-    Faz scraping de https://www.fundamentus.com.br/resultado.php
-    Retorna DataFrame limpo com os indicadores fundamentalistas.
+    Scraping do Fundamentus via sessão HTTP.
+    Colunas com dados reais: ROE, ROIC, Div.Yield, Mrg.Líq., Mrg Ebit, Cresc.Rec.5a
+    Colunas com dados ausentes por limitação do site: P/L, P/VP, EV/EBITDA, Liq.2meses
     """
-    url = "https://www.fundamentus.com.br/resultado.php"
-    headers = {
+    session = requests.Session()
+    session.headers.update({
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "pt-BR,pt;q=0.9",
+        "Referer": "https://www.fundamentus.com.br/",
+    })
 
     try:
-        response = requests.get(url, headers=headers, timeout=15)
+        session.get("https://www.fundamentus.com.br/", timeout=10)
+        response = session.get(
+            "https://www.fundamentus.com.br/resultado.php",
+            timeout=20,
+        )
         response.raise_for_status()
+        response.encoding = "utf-8"
     except requests.exceptions.RequestException as e:
         st.warning(f"Não foi possível acessar o Fundamentus: {e}")
         return pd.DataFrame()
 
     try:
-        tables = pd.read_html(
-            io.StringIO(response.text),
-            decimal=",",
-            thousands=".",
-            encoding="utf-8",
-        )
+        tables = pd.read_html(io.StringIO(response.text), flavor="lxml", encoding="utf-8")
         if not tables:
             st.warning("Nenhuma tabela encontrada no Fundamentus.")
             return pd.DataFrame()
-
         df = tables[0].copy()
     except Exception as e:
         st.warning(f"Erro ao parsear HTML do Fundamentus: {e}")
         return pd.DataFrame()
 
-    # Padroniza nomes de colunas
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Colunas percentuais — converter de string %
-    pct_cols = ["ROE", "ROIC", "Mrg Ebit", "Mrg. Líq.", "Cresc. Rec.5a", "Div.Yield"]
-    for col in pct_cols:
+    # Campos percentuais com dados REAIS via scraping
+    pct_real = ["ROE", "ROIC", "Mrg Ebit", "Mrg. Líq.", "Cresc. Rec.5a", "Div.Yield"]
+    for col in pct_real:
         if col in df.columns:
-            df[col] = _pct(df[col])
+            df[col] = df[col].apply(_pct_br)
 
-    # Colunas numéricas
+    # Campos numéricos — chegam como '000', manter como NaN para indicar ausência
     num_cols = ["P/L", "P/VP", "EV/EBITDA", "Liq.2meses", "Liq. Corr.", "Dív.Brut/ Patrim."]
     for col in num_cols:
         if col in df.columns:
-            df[col] = _num(df[col])
+            df[col] = df[col].apply(_num_br)
 
-    # Remove linhas onde o papel está vazio
     if "Papel" in df.columns:
-        df = df[df["Papel"].notna() & (df["Papel"] != "")]
+        df = df[df["Papel"].notna() & (df["Papel"].astype(str).str.strip() != "")]
 
-    df = df.reset_index(drop=True)
-    return df
+    return df.reset_index(drop=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Filtros — somente pelos campos com dados reais
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: Campos que funcionam corretamente via scraping estático
+FILTERABLE_FIELDS = {"ROE", "ROIC", "Div.Yield", "Mrg. Líq.", "Mrg Ebit"}
 
 
 def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
     """
-    Aplica filtros do usuário ao DataFrame do Fundamentus.
-
-    Parâmetros em `filters`:
-        - pl_max: float           → P/L máximo
-        - pvp_max: float          → P/VP máximo
-        - roe_min: float          → ROE mínimo (como fração, ex: 0.10)
-        - dy_min: float           → Dividend Yield mínimo (fração)
-        - roic_min: float         → ROIC mínimo (fração)
-        - liq_min: float          → Liquidez mínima (Liq.2meses em R$)
-        - ev_ebitda_max: float    → EV/EBITDA máximo
-        - margem_liq_min: float   → Margem Líquida mínima (fração)
+    Aplica filtros funcionais ao DataFrame.
+    Filtros com valor 0 (ou ≤ limiar mínimo) são **ignorados**.
     """
     mask = pd.Series([True] * len(df), index=df.index)
 
-    if "pl_max" in filters and "P/L" in df.columns:
-        mask &= (df["P/L"] > 0) & (df["P/L"] <= filters["pl_max"])
+    def col(name: str) -> pd.Series:
+        return pd.to_numeric(df[name], errors="coerce")
 
-    if "pvp_max" in filters and "P/VP" in df.columns:
-        mask &= (df["P/VP"] > 0) & (df["P/VP"] <= filters["pvp_max"])
+    # ROE mínimo
+    roe_min = filters.get("roe_min", 0)
+    if roe_min > 0 and "ROE" in df.columns:
+        mask &= col("ROE") >= roe_min
 
-    if "roe_min" in filters and "ROE" in df.columns:
-        mask &= df["ROE"] >= filters["roe_min"]
+    # ROIC mínimo
+    roic_min = filters.get("roic_min", 0)
+    if roic_min > 0 and "ROIC" in df.columns:
+        mask &= col("ROIC") >= roic_min
 
-    if "dy_min" in filters and "Div.Yield" in df.columns:
-        mask &= df["Div.Yield"] >= filters["dy_min"]
+    # Div.Yield mínimo
+    dy_min = filters.get("dy_min", 0)
+    if dy_min > 0 and "Div.Yield" in df.columns:
+        mask &= col("Div.Yield") >= dy_min
 
-    if "roic_min" in filters and "ROIC" in df.columns:
-        mask &= df["ROIC"] >= filters["roic_min"]
+    # Margem líquida mínima (aceita negativos: -0.10 = até -10%)
+    mrg_min = filters.get("margem_liq_min", None)
+    if mrg_min is not None and mrg_min > -0.49 and "Mrg. Líq." in df.columns:
+        mask &= col("Mrg. Líq.") >= mrg_min
 
-    if "liq_min" in filters and "Liq.2meses" in df.columns:
-        mask &= df["Liq.2meses"] >= filters["liq_min"]
+    # Margem EBIT mínima
+    ebit_min = filters.get("margem_ebit_min", None)
+    if ebit_min is not None and ebit_min > -0.49 and "Mrg Ebit" in df.columns:
+        mask &= col("Mrg Ebit") >= ebit_min
 
-    if "ev_ebitda_max" in filters and "EV/EBITDA" in df.columns:
-        mask &= (df["EV/EBITDA"] > 0) & (df["EV/EBITDA"] <= filters["ev_ebitda_max"])
-
-    if "margem_liq_min" in filters and "Mrg. Líq." in df.columns:
-        mask &= df["Mrg. Líq."] >= filters["margem_liq_min"]
+    # Crescimento receita mínimo
+    cresc_min = filters.get("cresc_min", None)
+    if cresc_min is not None and cresc_min > -0.49 and "Cresc. Rec.5a" in df.columns:
+        mask &= col("Cresc. Rec.5a") >= cresc_min
 
     return df[mask].reset_index(drop=True)
